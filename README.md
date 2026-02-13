@@ -1,1 +1,5 @@
-# Expense Tracker App : Built with AXUM and AKASMA.
+# Expense Tracker App : Built with
+```
+rust, axum, sqlx , htmx, tailwindcss (daisyUI)
+```
+.
