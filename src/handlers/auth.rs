@@ -9,10 +9,28 @@ use crate::models::user::User;
 use crate::services;
 use crate::state::AppState;
 
-async fn process_sign_up(
-    state: &AppState,
-    payload: &SignUpInput,
-) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+type AuthError = (StatusCode, Json<ErrorResponse>);
+
+// Database error helper
+fn handle_db_error(e: sqlx::Error) -> AuthError {
+    if let sqlx::Error::Database(db_err) = &e {
+        // PostgreSQL unique violation
+        if db_err.code() == Some(std::borrow::Cow::Borrowed("23505")) {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse::new("Email already exists")),
+            );
+        }
+    }
+
+    tracing::error!("Database error: {:?}", e);
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse::new("Database error")),
+    )
+}
+
+async fn process_sign_up(state: &AppState, payload: &SignUpInput) -> Result<String, AuthError> {
     let password_hash = User::hash_password(&payload.password);
 
     let user_id: Uuid = sqlx::query_scalar(
@@ -26,29 +44,7 @@ async fn process_sign_up(
     .bind(password_hash)
     .fetch_one(&state.pool)
     .await
-    .map_err(|e| {
-        if let sqlx::Error::Database(db_err) = &e {
-            if db_err.code() == Some(std::borrow::Cow::Borrowed("23505")) {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(ErrorResponse {
-                        success: false,
-                        error: "Email already exists".to_string(),
-                        details: None,
-                    }),
-                );
-            }
-        }
-
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                success: false,
-                error: "Database Error".to_string(),
-                details: None,
-            }),
-        )
-    })?;
+    .map_err(handle_db_error)?;
 
     Ok(user_id.to_string())
 }
@@ -56,19 +52,40 @@ async fn process_sign_up(
 pub async fn process_sign_in(
     state: &AppState,
     payload: &SignInInput,
-) -> Result<AuthResult, (StatusCode, String)> {
+) -> Result<AuthResult, AuthError> {
     let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email=$1")
         .bind(&payload.email)
-        .fetch_one(&state.pool)
+        .fetch_optional(&state.pool)
         .await
-        .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid email or password".into()))?;
+        .map_err(|e| {
+            tracing::error!("Database error during sign in : {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Database error")),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse::new("Invalid email or password")),
+            )
+        })?;
 
     if !user.verify_password(&payload.password) {
-        return Err((StatusCode::UNAUTHORIZED, "Invalid password".into()))?;
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse::new("Invalid email or password")),
+        ));
     }
 
-    let token = services::auth::encode_token(&user.id.to_string(), &state.jwt_secret, 24)
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Token error".into()))?;
+    let token =
+        services::auth::encode_token(&user.id.to_string(), &state.jwt_secret, 24).map_err(|e| {
+            tracing::error!("Token generation error: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new("Authentication error")),
+            )
+        })?;
 
     Ok(AuthResult {
         token,
@@ -80,102 +97,78 @@ pub async fn process_sign_in(
     })
 }
 
-async fn process_sign_in_token(
-    state: &AppState,
-    payload: &SignInInput,
-) -> Result<String, (StatusCode, String)> {
-    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email=$1")
-        .bind(&payload.email)
-        .fetch_one(&state.pool)
-        .await
-        .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid email or password".into()))?;
-
-    if !user.verify_password(&payload.password) {
-        return Err((StatusCode::UNAUTHORIZED, "Invalid password".into()));
-    }
-
-    let token = services::auth::encode_token(&user.id.to_string(), &state.jwt_secret, 24)
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Token error".into()))?;
-
-    Ok(token)
-}
-
 pub async fn sign_up_form(
     State(state): State<AppState>,
     Form(payload): Form<SignUpInput>,
-) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
-    let _user_id = process_sign_up(&state, &payload).await?;
+) -> Result<Response, AuthError> {
+    process_sign_up(&state, &payload).await?;
+
     let mut headers = HeaderMap::new();
     headers.insert("HX-Redirect", HeaderValue::from_static("/signin"));
+
     Ok((headers, Html(String::new())).into_response())
 }
 
 pub async fn sign_in_form(
     State(state): State<AppState>,
     Form(payload): Form<SignInInput>,
-) -> Result<Response, (StatusCode, String)> {
-    let token = process_sign_in_token(&state, &payload).await?;
-    let mut headers = HeaderMap::new();
+) -> Result<Response, AuthError> {
+    let auth_result = process_sign_in(&state, &payload).await?;
 
+    let mut headers = HeaderMap::new();
     headers.insert(
         "Set-Cookie",
         HeaderValue::from_str(&format!(
             "auth_token={}; HttpOnly; Path=/; SameSite=Lax",
-            token
+            auth_result.token
         ))
         .map_err(|e| {
+            tracing::error!("Invalid header value: {:?}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Invalid header: {}", e),
+                Json(ErrorResponse::new("Authentication error")),
             )
         })?,
     );
     headers.insert("HX-Redirect", HeaderValue::from_static("/dashboard"));
+
     Ok((StatusCode::OK, headers, Html(String::new())).into_response())
 }
 
 pub async fn sign_up_json(
     State(state): State<AppState>,
     Json(payload): Json<SignUpInput>,
-) -> Result<Json<ApiResponse<UserData>>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<ApiResponse<UserData>>, AuthError> {
     let name = payload.name.clone();
     let email = payload.email.clone();
     let user_id = process_sign_up(&state, &payload).await?;
 
-    let response = ApiResponse {
-        status: "success".to_string(),
-        message: "User created successfully".to_string(),
-        data: UserData {
+    Ok(Json(ApiResponse::success(
+        "User created successfully",
+        UserData {
             id: user_id,
             name,
             email,
         },
-    };
-
-    Ok(Json(response))
+    )))
 }
 
 pub async fn sign_in_json(
     State(state): State<AppState>,
     Json(payload): Json<SignInInput>,
-) -> Result<Json<ApiResponse<AuthResult>>, (StatusCode, String)> {
+) -> Result<Json<ApiResponse<AuthResult>>, AuthError> {
     let auth = process_sign_in(&state, &payload).await?;
 
-    let response = ApiResponse {
-        status: "success".to_string(),
-        message: "Signed in successfully".to_string(),
-        data: auth,
-    };
-
-    Ok(Json(response))
+    Ok(Json(ApiResponse::success("Signed in successfully", auth)))
 }
 
-pub async fn signout(State(_state): State<AppState>) -> Result<Response, (StatusCode, String)> {
+pub async fn signout(State(_state): State<AppState>) -> Result<Response, AuthError> {
     let mut headers = HeaderMap::new();
     headers.insert(
         "Set-Cookie",
         HeaderValue::from_static("auth_token=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0"),
     );
     headers.insert("HX-Redirect", HeaderValue::from_static("/signin"));
+
     Ok((StatusCode::OK, headers, Html(String::new())).into_response())
 }
