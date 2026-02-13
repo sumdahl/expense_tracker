@@ -3,14 +3,30 @@ use axum::response::{IntoResponse, Response};
 use axum::{extract::State, response::Html, Form, Json};
 use uuid::Uuid;
 
+use serde::Serialize;
+
 use crate::models::auth::{SignInInput, SignUpInput};
 use crate::models::user::User;
 use crate::services;
 use crate::state::AppState;
 
+#[derive(Serialize)]
+pub struct ApiResponse<T> {
+    pub status: String,
+    pub message: String,
+    pub data: T,
+}
+
+#[derive(Serialize)]
+pub struct UserData {
+    pub id: String,
+    pub name: String,
+    pub email: String,
+}
+
 async fn process_sign_up(
     state: &AppState,
-    payload: SignUpInput,
+    payload: &SignUpInput,
 ) -> Result<String, (StatusCode, String)> {
     let password_hash = User::hash_password(&payload.password);
 
@@ -20,8 +36,8 @@ async fn process_sign_up(
         RETURNING id",
     )
     .bind(Uuid::new_v4())
-    .bind(payload.name)
-    .bind(payload.email)
+    .bind(&payload.name)
+    .bind(&payload.email)
     .bind(password_hash)
     .fetch_one(&state.pool)
     .await
@@ -54,7 +70,7 @@ pub async fn sign_up_form(
     State(state): State<AppState>,
     Form(payload): Form<SignUpInput>,
 ) -> Result<Response, (StatusCode, String)> {
-    let _user_id = process_sign_up(&state, payload).await?;
+    let _user_id = process_sign_up(&state, &payload).await?;
     let mut headers = HeaderMap::new();
     headers.insert("HX-Redirect", HeaderValue::from_static("/signin"));
     Ok((headers, Html(String::new())).into_response())
@@ -84,12 +100,33 @@ pub async fn sign_in_form(
     Ok((StatusCode::OK, headers, Html(String::new())).into_response())
 }
 
+// pub async fn sign_up_json(
+//     State(state): State<AppState>,
+//     Json(payload): Json<SignUpInput>,
+// ) -> Result<Json<String>, (StatusCode, String)> {
+//     let user_id = process_sign_up(&state, payload).await?;
+//     Ok(Json(format!("User created with id : {}", user_id)))
+// }
+
 pub async fn sign_up_json(
     State(state): State<AppState>,
     Json(payload): Json<SignUpInput>,
-) -> Result<Json<String>, (StatusCode, String)> {
-    let user_id = process_sign_up(&state, payload).await?;
-    Ok(Json(format!("User created with id : {}", user_id)))
+) -> Result<Json<ApiResponse<UserData>>, (StatusCode, String)> {
+    let name = payload.name.clone();
+    let email = payload.email.clone();
+    let user_id = process_sign_up(&state, &payload).await?;
+
+    let response = ApiResponse {
+        status: "success".to_string(),
+        message: "User created successfully".to_string(),
+        data: UserData {
+            id: user_id,
+            name,
+            email,
+        },
+    };
+
+    Ok(Json(response))
 }
 
 pub async fn sign_in_json(
