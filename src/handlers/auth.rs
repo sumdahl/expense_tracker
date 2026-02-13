@@ -1,4 +1,6 @@
-use axum::{extract::State, Json};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::{extract::State, response::Html, Form, Json};
 use uuid::Uuid;
 
 use crate::models::auth::{SignInInput, SignUpInput};
@@ -6,10 +8,10 @@ use crate::models::user::User;
 use crate::services;
 use crate::state::AppState;
 
-pub async fn sign_up(
-    State(state): State<AppState>,
-    Json(payload): Json<SignUpInput>,
-) -> Result<Json<String>, (axum::http::StatusCode, String)> {
+async fn process_sign_up(
+    state: &AppState,
+    payload: SignUpInput,
+) -> Result<String, (StatusCode, String)> {
     let password_hash = User::hash_password(&payload.password);
 
     let user_id: Uuid = sqlx::query_scalar(
@@ -23,46 +25,87 @@ pub async fn sign_up(
     .bind(password_hash)
     .fetch_one(&state.pool)
     .await
-    .map_err(|_| {
-        (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "DB error".into(),
-        )
-    })?;
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into()))?;
 
-    Ok(Json(format!("User created with id : {}", user_id)))
+    Ok(user_id.to_string())
 }
 
-pub async fn sign_in(
-    State(state): State<AppState>,
-    Json(payload): Json<SignInInput>,
-) -> Result<Json<String>, (axum::http::StatusCode, String)> {
+async fn process_sign_in(
+    state: &AppState,
+    payload: SignInInput,
+) -> Result<String, (StatusCode, String)> {
     let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email=$1")
         .bind(payload.email)
         .fetch_one(&state.pool)
         .await
-        .map_err(|_| {
-            (
-                axum::http::StatusCode::UNAUTHORIZED,
-                "Invalid email or password".into(),
-            )
-        })?;
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid email or password".into()))?;
 
     if !user.verify_password(&payload.password) {
-        return Err((
-            axum::http::StatusCode::UNAUTHORIZED,
-            "Invalid password".into(),
-        ))?;
+        return Err((StatusCode::UNAUTHORIZED, "Invalid password".into()))?;
     }
 
-    let token = services::auth::encode_token(&user.id.to_string(), &state.jwt_secret, 24).map_err(
-        |_| {
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Token error".into(),
-            )
-        },
-    )?;
+    let token = services::auth::encode_token(&user.id.to_string(), &state.jwt_secret, 24)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Token error".into()))?;
 
+    Ok(token)
+}
+
+pub async fn sign_up_form(
+    State(state): State<AppState>,
+    Form(payload): Form<SignUpInput>,
+) -> Result<Response, (StatusCode, String)> {
+    let _user_id = process_sign_up(&state, payload).await?;
+    let mut headers = HeaderMap::new();
+    headers.insert("HX-Redirect", HeaderValue::from_static("/signin"));
+    Ok((headers, Html(String::new())).into_response())
+}
+
+pub async fn sign_in_form(
+    State(state): State<AppState>,
+    Form(payload): Form<SignInInput>,
+) -> Result<Response, (StatusCode, String)> {
+    let token = process_sign_in(&state, payload).await?;
+    let mut headers = HeaderMap::new();
+
+    headers.insert(
+        "Set-Cookie",
+        HeaderValue::from_str(&format!(
+            "auth_token={}; HttpOnly; Path=/; SameSite=Lax",
+            token
+        ))
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Invalid header: {}", e),
+            )
+        })?,
+    );
+    headers.insert("HX-Redirect", HeaderValue::from_static("/dashboard"));
+    Ok((StatusCode::OK, headers, Html(String::new())).into_response())
+}
+
+pub async fn sign_up_json(
+    State(state): State<AppState>,
+    Json(payload): Json<SignUpInput>,
+) -> Result<Json<String>, (StatusCode, String)> {
+    let user_id = process_sign_up(&state, payload).await?;
+    Ok(Json(format!("User created with id : {}", user_id)))
+}
+
+pub async fn sign_in_json(
+    State(state): State<AppState>,
+    Json(payload): Json<SignInInput>,
+) -> Result<Json<String>, (StatusCode, String)> {
+    let token = process_sign_in(&state, payload).await?;
     Ok(Json(token))
+}
+
+pub async fn signout(State(_state): State<AppState>) -> Result<Response, (StatusCode, String)> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "Set-Cookie",
+        HeaderValue::from_static("auth_token=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0"),
+    );
+    headers.insert("HX-Redirect", HeaderValue::from_static("/signin"));
+    Ok((StatusCode::OK, headers, Html(String::new())).into_response())
 }

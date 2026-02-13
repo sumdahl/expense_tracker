@@ -22,8 +22,9 @@ async fn main() {
     };
 
     let app = Router::new()
+        .merge(routes::pages::router(state.clone()))
         .merge(routes::auth::router())
-        .merge(routes::expenses::router())
+        .merge(routes::expenses::router(state.clone()))
         .with_state(state);
 
     let listener = TcpListener::bind("0.0.0.0:8080").await.unwrap();

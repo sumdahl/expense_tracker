@@ -40,6 +40,10 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Middleware utilities (optional for Axum)
 tower = "0.4"
+tower-http = { version = "0.5", features = ["fs"] }
+
+# Templates
+askama = "0.12"
 
 # Logging (optional but recommended)
 tracing = "0.1"

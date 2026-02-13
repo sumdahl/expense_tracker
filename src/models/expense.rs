@@ -10,6 +10,13 @@ pub struct CreateExpense {
     pub category: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct UpdateExpense {
+    pub title: Option<String>,
+    pub amount: Option<f64>,
+    pub category: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, FromRow)]
 pub struct Expense {
     pub id: Uuid,
