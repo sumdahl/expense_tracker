@@ -3,26 +3,11 @@ use axum::response::{IntoResponse, Response};
 use axum::{extract::State, response::Html, Form, Json};
 use uuid::Uuid;
 
-use serde::Serialize;
-
 use crate::models::auth::{SignInInput, SignUpInput};
+use crate::models::response::{ApiResponse, AuthResult, UserData};
 use crate::models::user::User;
 use crate::services;
 use crate::state::AppState;
-
-#[derive(Serialize)]
-pub struct ApiResponse<T> {
-    pub status: String,
-    pub message: String,
-    pub data: T,
-}
-
-#[derive(Serialize)]
-pub struct UserData {
-    pub id: String,
-    pub name: String,
-    pub email: String,
-}
 
 async fn process_sign_up(
     state: &AppState,
@@ -46,18 +31,45 @@ async fn process_sign_up(
     Ok(user_id.to_string())
 }
 
-async fn process_sign_in(
+pub async fn process_sign_in(
     state: &AppState,
-    payload: SignInInput,
-) -> Result<String, (StatusCode, String)> {
+    payload: &SignInInput,
+) -> Result<AuthResult, (StatusCode, String)> {
     let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email=$1")
-        .bind(payload.email)
+        .bind(&payload.email)
         .fetch_one(&state.pool)
         .await
         .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid email or password".into()))?;
 
     if !user.verify_password(&payload.password) {
         return Err((StatusCode::UNAUTHORIZED, "Invalid password".into()))?;
+    }
+
+    let token = services::auth::encode_token(&user.id.to_string(), &state.jwt_secret, 24)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Token error".into()))?;
+
+    Ok(AuthResult {
+        token,
+        user: UserData {
+            id: user.id.to_string(),
+            name: user.name,
+            email: user.email,
+        },
+    })
+}
+
+async fn process_sign_in_token(
+    state: &AppState,
+    payload: &SignInInput,
+) -> Result<String, (StatusCode, String)> {
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email=$1")
+        .bind(&payload.email)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid email or password".into()))?;
+
+    if !user.verify_password(&payload.password) {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid password".into()));
     }
 
     let token = services::auth::encode_token(&user.id.to_string(), &state.jwt_secret, 24)
@@ -80,7 +92,7 @@ pub async fn sign_in_form(
     State(state): State<AppState>,
     Form(payload): Form<SignInInput>,
 ) -> Result<Response, (StatusCode, String)> {
-    let token = process_sign_in(&state, payload).await?;
+    let token = process_sign_in_token(&state, &payload).await?;
     let mut headers = HeaderMap::new();
 
     headers.insert(
@@ -99,14 +111,6 @@ pub async fn sign_in_form(
     headers.insert("HX-Redirect", HeaderValue::from_static("/dashboard"));
     Ok((StatusCode::OK, headers, Html(String::new())).into_response())
 }
-
-// pub async fn sign_up_json(
-//     State(state): State<AppState>,
-//     Json(payload): Json<SignUpInput>,
-// ) -> Result<Json<String>, (StatusCode, String)> {
-//     let user_id = process_sign_up(&state, payload).await?;
-//     Ok(Json(format!("User created with id : {}", user_id)))
-// }
 
 pub async fn sign_up_json(
     State(state): State<AppState>,
@@ -132,9 +136,16 @@ pub async fn sign_up_json(
 pub async fn sign_in_json(
     State(state): State<AppState>,
     Json(payload): Json<SignInInput>,
-) -> Result<Json<String>, (StatusCode, String)> {
-    let token = process_sign_in(&state, payload).await?;
-    Ok(Json(token))
+) -> Result<Json<ApiResponse<AuthResult>>, (StatusCode, String)> {
+    let auth = process_sign_in(&state, &payload).await?;
+
+    let response = ApiResponse {
+        status: "success".to_string(),
+        message: "Signed in successfully".to_string(),
+        data: auth,
+    };
+
+    Ok(Json(response))
 }
 
 pub async fn signout(State(_state): State<AppState>) -> Result<Response, (StatusCode, String)> {
