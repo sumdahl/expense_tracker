@@ -4,7 +4,7 @@ use axum::{extract::State, response::Html, Form, Json};
 use uuid::Uuid;
 
 use crate::models::auth::{SignInInput, SignUpInput};
-use crate::models::response::{ApiResponse, AuthResult, UserData};
+use crate::models::response::{ApiResponse, AuthResult, ErrorResponse, UserData};
 use crate::models::user::User;
 use crate::services;
 use crate::state::AppState;
@@ -12,7 +12,7 @@ use crate::state::AppState;
 async fn process_sign_up(
     state: &AppState,
     payload: &SignUpInput,
-) -> Result<String, (StatusCode, String)> {
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
     let password_hash = User::hash_password(&payload.password);
 
     let user_id: Uuid = sqlx::query_scalar(
@@ -26,7 +26,29 @@ async fn process_sign_up(
     .bind(password_hash)
     .fetch_one(&state.pool)
     .await
-    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into()))?;
+    .map_err(|e| {
+        if let sqlx::Error::Database(db_err) = &e {
+            if db_err.code() == Some(std::borrow::Cow::Borrowed("23505")) {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(ErrorResponse {
+                        success: false,
+                        error: "Email already exists".to_string(),
+                        details: None,
+                    }),
+                );
+            }
+        }
+
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: "Database Error".to_string(),
+                details: None,
+            }),
+        )
+    })?;
 
     Ok(user_id.to_string())
 }
@@ -81,7 +103,7 @@ async fn process_sign_in_token(
 pub async fn sign_up_form(
     State(state): State<AppState>,
     Form(payload): Form<SignUpInput>,
-) -> Result<Response, (StatusCode, String)> {
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     let _user_id = process_sign_up(&state, &payload).await?;
     let mut headers = HeaderMap::new();
     headers.insert("HX-Redirect", HeaderValue::from_static("/signin"));
@@ -115,7 +137,7 @@ pub async fn sign_in_form(
 pub async fn sign_up_json(
     State(state): State<AppState>,
     Json(payload): Json<SignUpInput>,
-) -> Result<Json<ApiResponse<UserData>>, (StatusCode, String)> {
+) -> Result<Json<ApiResponse<UserData>>, (StatusCode, Json<ErrorResponse>)> {
     let name = payload.name.clone();
     let email = payload.email.clone();
     let user_id = process_sign_up(&state, &payload).await?;
